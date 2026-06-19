@@ -1,0 +1,1077 @@
+#!/usr/bin/env bash
+# canvas — a node-link diagram of a JSON file on an infinite pan/zoom canvas,
+# rendered as character-cell graphics with semantic-zoom LOD.
+#
+# bash is the conductor: it never scans bytes in a loop. scan.awk fetches the
+# direct children of a container from a byte offset (reading only a small slice),
+# and render.awk rasterizes the visible nodes into one terminal frame. Both costs
+# are bounded by what's on screen, not by file size.
+#
+# Usage:
+#   ./canvas file.json                         interactive
+#   ./canvas file.json --frame X Y ZI [C R]    print ONE frame (non-interactive)
+set -u
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SCAN="$HERE/lib/scan.awk"
+REND="$HERE/lib/render.awk"
+FILE="${1:-}"
+[ -z "$FILE" ] && { echo "usage: $0 file.json" >&2; exit 1; }
+[ -f "$FILE" ] || { echo "no such file: $FILE" >&2; exit 1; }
+
+SLICE_LEN=131072
+CKSTEP=256          # sparse byte-offset checkpoint every N elements (huge lists)
+US=$'\x1f'
+FILESIZE=$(wc -c < "$FILE")
+
+# ---- layout / model constants ----
+COLW=52; VGAP=1                 # column pitch; vertical gap between stacked boxes
+MAXNODES=200; MAXDEPTH=7        # safety caps for the v1 bounded build
+MAXROWS=14; MAXW=44; MINW=6     # per-box: max content rows, max/min box width
+
+# zoom ladder + matching pan step (world units per keypress ~ 8/zoom)
+ZOOMS=(0.10 0.16 0.25 0.40 0.60 1.00 1.50 2.00)
+PANS=(80   50   32   20   13   8    5    4)
+ZI=5
+# camera: CX/CY = world coords of the SCREEN CENTRE (the canonical state). The
+# top-left camX/camY handed to render.awk are DERIVED from CX/CY each draw
+# (derive_cam), so zooming is about the centre and is perfectly reversible — no
+# rounding drift accumulates between zoom levels.
+CX=0; CY=0; camX=0; camY=0
+
+# linked tree side panel: an indented outline of the model on the left, kept in
+# sync with the canvas. PANEL on/off ('t'); TREEFOCUS routes j/k to the tree
+# cursor ('Tab' toggles); selecting a tree node re-centres the canvas on it.
+PANEL=1; PANELW=34; TREEFOCUS=0; TREETOP=0; CENTERED=0
+TREEMAXIND=10        # cap tree indentation so deep spines stay readable in the panel
+CURREF="n0"      # tree cursor: "n<id>" model node, or "e<list>:<idx>" list element
+ENT_W=0          # window-start element index of the entered list (for tree previews)
+PATHREF="n0"; CRUMB=""; NP=""   # breadcrumb of the current selection (set each frame)
+declare -a TREF=() TDEP=() TTXT=(); TLN=0
+
+# ---- model (parallel arrays, indexed by node id) ----
+# A node is a container (object/array). Its scalar children are shown as rows
+# INSIDE its box; its container children become separate nodes (mKids), each
+# reached from a handle row at index mHandleRow.
+declare -a mPar mDepth mType mKey mIdx mValOff mKids mRows mNRows mHandleRow
+declare -a mWX mWY mWW mWH mLH
+# huge containers are virtualized: rendered as a windowed list box (no child-node
+# fan-out). mHuge marks them; mFirstOff = byte offset of element 0; mCkptN = a
+# sparse "idx:off idx:off" byte index grown while scrolling; mKnownN/mDoneN track
+# how far we've enumerated. mLH = layout height (bounded) vs mWH = render height.
+declare -a mHuge mFirstOff mCkptN mKnownN mDoneN mHugeLabel
+M=0
+
+# read a byte slice [off, off+len) without touching the rest of the file
+slice() { if [ "$1" -le 0 ]; then head -c "$2" "$FILE"; else tail -c "+$(( $1 + 1 ))" "$FILE" | head -c "$2"; fi; }
+
+joinrow() { local IFS=$US; printf '%s\n' "$*"; }
+# append a \x1f-joined record to the caller's `lines` array WITHOUT forking a
+# subshell. bash dynamic scope lets this see frame()'s local `lines`. Replacing
+# the per-node $(joinrow …) command-substitutions with this removed the main
+# source of input lag (one fork per node/edge/panel line, every frame).
+addline() { local IFS=$US; lines+=("$*"); }
+
+# scan_slice OFF [CONT] [ISOBJ] -> fills gc*[] + GN with the children found in ONE
+# slice, plus GRESUME (absolute offset to continue) and GCLOSED (1 if the
+# container's closing bracket was reached). CONT=1 resumes mid-container.
+scan_slice() {
+  local off=$1 cont=${2:-0} isobj=${3:-0} c1 c2 c3 c4 c5 c6 c7
+  GN=0; gcType=(); gcKey=(); gcEoff=(); gcValOff=(); gcLen=(); gcPart=(); gcPrev=()
+  GRESUME=$off; GCLOSED=0
+  local aw=(-v maxitems=0)
+  [ "$cont" = 1 ] && aw+=(-v cont=1 -v isobj="$isobj")
+  while IFS=$US read -r c1 c2 c3 c4 c5 c6 c7; do
+    if [ "$c1" = "@" ]; then GRESUME=$(( off + c2 )); [ "$c3" = 1 ] && GCLOSED=1; continue; fi
+    gcType[GN]="$c1"; gcKey[GN]="$c2"; gcEoff[GN]=$(( off + c3 )); gcValOff[GN]=$(( off + c4 ))
+    gcLen[GN]="$c5"; gcPart[GN]="$c6"; gcPrev[GN]="$c7"
+    GN=$(( GN + 1 ))
+  done < <(slice "$off" "$SLICE_LEN" | awk "${aw[@]}" -f "$SCAN")
+}
+
+# find the root container's byte offset and type
+init_root() {
+  local m; m=$(head -c 65536 "$FILE" | grep -aboE '[{[]' | head -1)
+  [ -z "$m" ] && { echo "no JSON object/array found near start of file" >&2; exit 1; }
+  ROOTOFF=${m%%:*}; local oc=${m##*:}
+  M=1; mPar[0]=-1; mDepth[0]=0; mKey[0]="root"; mIdx[0]=0
+  mValOff[0]=$ROOTOFF; mKids[0]=""; mHandleRow[0]=0
+  mType[0]=$([ "$oc" = "{" ] && echo object || echo array)
+}
+
+# expand ONE container node: fetch its direct children once. Scalars become inline
+# rows of THIS box; container children become stub child nodes (returned in
+# NEWKIDS[] for the caller to queue). A container with more than MAXROWS direct
+# children is virtualized (mHuge=1) instead of fanned out. Reused by build_model
+# (whole tree) and drill_into (one huge-list element).
+declare -a NEWKIDS=()
+expand_container() {
+  local id=$1                       # assign id FIRST: a later same-line ${mDepth[id]}
+  local d=${mDepth[id]}             # would expand before local binds id and leak an
+  local c nid parIsArr name rowtxt flag maxw nr first nest li avg   # outer id.
+  NEWKIDS=()
+  scan_slice "${mValOff[id]}" 0 0
+  if [ "$GN" -eq 0 ]; then
+    mRows[id]="0(empty)"; mNRows[id]=1; mWW[id]=$MINW; mWH[id]=3; mLH[id]=3
+    mKids[id]=""; mHuge[id]=0; return
+  fi
+
+  # HUGE container (more direct children than a box can show) -> virtualize as a
+  # windowed list box, no child-node fan-out. NOTE: we key off child COUNT, not
+  # "did it close": a small container (e.g. root {meta,records}) may fail to close
+  # in one slice only because ONE child is enormous — that child gets fanned out
+  # and is itself detected huge when we scan into it.
+  if [ "$GN" -gt "$MAXROWS" ]; then
+    first=${gcEoff[0]}
+    if [ "$GCLOSED" = 1 ]; then
+      nest=$GN                                       # closed: exact count known
+    else
+      li=$(( GN - 1 ))
+      avg=$(( GN > 1 ? (gcEoff[li] - first) / (GN - 1) : ${#gcPrev[0]} + 2 ))
+      [ "$avg" -lt 1 ] && avg=1
+      nest=$(( (FILESIZE - first) / avg ))           # estimate from avg element size
+      [ "$nest" -lt "$GN" ] && nest=$GN
+      [ "$nest" -gt 5000000 ] && nest=5000000
+    fi
+    mHuge[id]=1; mFirstOff[id]=$first; mCkptN[id]="0:$first"
+    mKnownN[id]=$GN; mDoneN[id]=$GCLOSED; mKids[id]=""
+    mWW[id]=$MAXW; mWH[id]=$(( nest + 2 )); mNRows[id]=$nest
+    mLH[id]=$(( (nest > 22 ? 22 : nest) + 2 ))
+    if [ "${mPar[id]}" -lt 0 ]; then mHugeLabel[id]="root"
+    elif [ "${mType[mPar[id]]}" = array ]; then mHugeLabel[id]="[${mIdx[id]}]"
+    else mHugeLabel[id]="${mKey[id]}"; fi
+    load_index "$id" || true          # use cached full index if present (exact count)
+    return
+  fi
+
+  # NORMAL container: scalars inline, containers fan out to stub child nodes.
+  parIsArr=0; [ "${mType[id]}" = array ] && parIsArr=1
+  local -a rowsArr=(); local kids=""; maxw=0; nr=0
+  for (( c=0; c<GN; c++ )); do
+    [ "$M" -ge "$MAXNODES" ] && break
+    case "${gcType[c]}" in
+      object|array)
+        flag=1
+        if [ "$parIsArr" = 1 ]; then name="[$c]"; else name="${gcKey[c]}"; fi
+        rowtxt="$name ${gcType[c]:0:3}"            # e.g. "addr obj", "[3] arr"
+        nid=$M; M=$(( M + 1 ))
+        mPar[nid]=$id; mDepth[nid]=$(( d + 1 )); mType[nid]=${gcType[c]}
+        mKey[nid]=${gcKey[c]}; mIdx[nid]=$c; mValOff[nid]=${gcValOff[c]}; mHandleRow[nid]=$nr
+        # stub defaults (overwritten if this node gets expanded later)
+        mKids[nid]=""; mHuge[nid]=0; mNRows[nid]=1; mRows[nid]="0$rowtxt …"
+        mWW[nid]=$(( ${#rowtxt} + 5 )); [ "${mWW[nid]}" -gt "$MAXW" ] && mWW[nid]=$MAXW
+        mWH[nid]=3; mLH[nid]=3
+        NEWKIDS+=("$nid"); kids="$kids $nid"
+        ;;
+      *)
+        flag=0
+        if [ "$parIsArr" = 1 ]; then rowtxt="${gcPrev[c]}"; else rowtxt="${gcKey[c]}: ${gcPrev[c]}"; fi
+        ;;
+    esac
+    rowtxt=${rowtxt:0:$(( MAXW - 2 ))}
+    [ ${#rowtxt} -gt "$maxw" ] && maxw=${#rowtxt}
+    rowsArr+=("${flag}${rowtxt}")
+    nr=$(( nr + 1 ))
+  done
+  local IFS=$'\x1e'; mRows[id]="${rowsArr[*]}"
+  mNRows[id]=$nr
+  mWW[id]=$(( maxw + 3 )); [ "${mWW[id]}" -lt "$MINW" ] && mWW[id]=$MINW; [ "${mWW[id]}" -gt "$MAXW" ] && mWW[id]=$MAXW
+  mWH[id]=$(( nr + 2 )); [ "${mWH[id]}" -lt 3 ] && mWH[id]=3
+  mLH[id]=${mWH[id]}; mHuge[id]=0; mKids[id]="$kids"
+}
+
+# breadth-first build a bounded slice of the tree from the root (MAXROWS per box,
+# MAXNODES total, MAXDEPTH deep). Huge containers are virtualized, not expanded.
+build_model() {
+  init_root
+  local queue=(0) id k
+  while [ ${#queue[@]} -gt 0 ] && [ "$M" -lt "$MAXNODES" ]; do
+    id=${queue[0]}; queue=("${queue[@]:1}")
+    case "${mType[id]}" in object|array) ;; *) continue;; esac
+    expand_container "$id"
+    for k in "${NEWKIDS[@]}"; do
+      [ "${mDepth[k]}" -lt "$MAXDEPTH" ] && [ "$M" -lt "$MAXNODES" ] && queue+=("$k")
+    done
+  done
+}
+
+# tidy layout: x = depth column; y packs subtrees top-to-bottom, each parent
+# centred on its child block. Box sizes (mWW/mWH) come from build_model.
+_lay() {
+  local id=$1; mWX[id]=$(( mDepth[id] * COLW ))
+  local kids=( ${mKids[id]} ) k f l ctop cbot start=$cursorY bottom
+  if [ ${#kids[@]} -eq 0 ]; then
+    mWY[id]=$cursorY
+  else
+    for k in "${kids[@]}"; do _lay "$k"; done
+    f=${kids[0]}; l=${kids[${#kids[@]}-1]}
+    ctop=${mWY[f]}; cbot=$(( mWY[l] + mLH[l] ))
+    mWY[id]=$(( (ctop + cbot) / 2 - mLH[id] / 2 ))
+    [ "${mWY[id]}" -lt "$start" ] && mWY[id]=$start
+  fi
+  bottom=$(( mWY[id] + mLH[id] ))
+  [ "$(( bottom + VGAP ))" -gt "$cursorY" ] && cursorY=$(( bottom + VGAP ))
+}
+layout() { cursorY=0; _lay 0; }
+
+# While browsing a huge list, hide the rest of the structure (sibling branches like
+# meta/schema and the root) so their edges don't cross the list and read as FALSE
+# connections (the "meta's child shown wired to records" bug). Visible = everything
+# when not browsing; else only the entered list + its drilled subtree.
+node_visible() {
+  local i=$1
+  [ "$ENTERED" -lt 0 ] && return 0
+  [ "$i" = "$ENTERED" ] && return 0
+  [ "$DRILL" -ge 0 ] && [ "$i" -ge "$PREDRILL_M" ] && return 0
+  return 1
+}
+
+# build C/N/B/E lines for the current camera, then pipe through the compositor.
+# Lines are assembled in the MAIN shell (not the pipe subshell) so window
+# materialization side effects (checkpoints, known/done) persist between frames.
+frame() {
+  local z=${ZOOMS[ZI]} i p ty inv w cnt pwd=0
+  local -a lines rowarr
+  [ "$PANEL" = 1 ] && pwd=$PANELW
+  lines=(); addline C "$camX" "$camY" "$z" "$COLS" "$CANVAS_ROWS" "$pwd"
+  for (( i=0; i<M; i++ )); do
+    node_visible "$i" || continue
+    # A huge list renders as a compact SUMMARY node EXCEPT when it's the one being
+    # browsed as a scrollable window. The summary applies to (a) any huge list that
+    # isn't the entered one, and (b) the TOP list we've drilled into (so its giant
+    # window doesn't tangle with the subtree). A *nested* huge list that is itself
+    # entered (e.g. via a goto path into records[..].history) still gets its window.
+    if [ "${mHuge[i]:-0}" = 1 ] && { [ "$i" != "${ENTERED:-Z}" ] || { [ "$DRILL" -ge 0 ] && [ "$i" = "${mPar[DRILL]:-Z}" ]; }; }; then
+      local cnt2 human r0 r1 r2 sw nrw bh
+      if [ "${mDoneN[i]}" = 1 ]; then cnt2=${mKnownN[i]}; else cnt2=${mNRows[i]}; fi
+      human_set "$cnt2" "${mDoneN[i]}"; human=$HN
+      r0="0${mHugeLabel[i]}"; r1="0[$human items]  ↵"
+      sw=${#mHugeLabel[i]}; [ $(( ${#human} + 9 )) -gt "$sw" ] && sw=$(( ${#human} + 9 ))
+      nrw=2; bh=4
+      if [ "$i" = "${ENTERED:-Z}" ] && [ "$DRILL" -ge 0 ]; then
+        r2="1[${mIdx[DRILL]}] ▸ open"; nrw=3; bh=5
+        [ $(( ${#mIdx[DRILL]} + 8 )) -gt "$sw" ] && sw=$(( ${#mIdx[DRILL]} + 8 ))
+      fi
+      sw=$(( sw + 3 )); [ "$sw" -gt "$MAXW" ] && sw=$MAXW; [ "$sw" -lt "$MINW" ] && sw=$MINW
+      if [ "$nrw" = 3 ]; then addline N "${mWX[i]}" "${mWY[i]}" "$sw" "$bh" "${mDepth[i]}" 3 "$r0" "$r1" "$r2"
+      else addline N "${mWX[i]}" "${mWY[i]}" "$sw" "$bh" "${mDepth[i]}" 2 "$r0" "$r1"; fi
+    elif [ "${mHuge[i]:-0}" = 1 ]; then
+      read -r inv w cnt < <(awk -v cy="$camY" -v cx="$camX" -v ct="$(( mWY[i] + 1 ))" \
+        -v bx="${mWX[i]}" -v bw="${mWW[i]}" -v R="$CANVAS_ROWS" -v C="$COLS" -v z="$z" 'BEGIN{
+          sx0=(bx-cx)*z; sx1=(bx+bw-cx)*z; inv=(sx1>=0 && sx0<C)?1:0
+          w=int(cy-ct); if(w<0)w=0
+          cnt=int(R/z)+3; if(cnt>400)cnt=400; if(cnt<1)cnt=1
+          print inv, w, cnt }')
+      [ "$inv" = 1 ] || continue
+      materialize_window_cached "$i" "$w" "$cnt"
+      [ "$i" = "$ENTERED" ] && ENT_W=$w               # remember window start for the tree
+      local fidx=-1; [ "$i" = "$ENTERED" ] && fidx=$SEL
+      addline B "${mWX[i]}" "${mWY[i]}" "${mWW[i]}" "${mWH[i]}" "${mDepth[i]}" "$w" "$fidx" "$WIN_GOT" "${WIN[@]}"
+    else
+      rowarr=()
+      [ -n "${mRows[i]:-}" ] && IFS=$'\x1e' read -ra rowarr <<< "${mRows[i]}"
+      addline N "${mWX[i]}" "${mWY[i]}" "${mWW[i]}" "${mWH[i]}" "${mDepth[i]}" "${mNRows[i]}" "${rowarr[@]}"
+    fi
+  done
+  local pr gap bx
+  for (( i=0; i<M; i++ )); do
+    p=${mPar[i]}; [ "$p" -lt 0 ] && continue
+    node_visible "$i" || continue
+    node_visible "$p" || continue
+    if [ "${mHuge[i]:-0}" = 1 ]; then ty=$(( mWY[i] + 1 )); else ty=$(( mWY[i] + mWH[i] / 2 )); fi
+    pr=$(( mWX[p] + mWW[p] ))                            # parent right edge (world x)
+    gap=$(( mWX[i] - pr )); [ "$gap" -lt 3 ] && gap=3
+    bx=$(( pr + 1 + ( mHandleRow[i] % (gap - 2) ) ))     # per-edge vertical channel
+    addline E "$pr" "$(( mWY[p] + 1 + mHandleRow[i] ))" "${mWX[i]}" "$ty" "$bx"
+  done
+
+  # ---- tree side panel: emit the visible slice of the outline as P records ----
+  if [ "$PANEL" = 1 ]; then
+    local cline centerline active vis li row st ind mk hdr centref vdep gpfx
+    build_tree
+    centref=$(cur_centered_ref)
+    cline=$(tree_line_of "$CURREF"); [ "$cline" -lt 0 ] && { CURREF=${TREF[0]:-n0}; cline=0; }
+    centerline=$(tree_line_of "$centref")
+    active=$([ "$TREEFOCUS" = 1 ] && echo "$cline" || echo "$centerline")
+    [ "$active" -lt 0 ] && active=0
+    vis=$(( CANVAS_ROWS - 1 ))                       # row 0 holds the header
+    [ "$active" -lt "$TREETOP" ] && TREETOP=$active
+    [ "$active" -ge $(( TREETOP + vis )) ] && TREETOP=$(( active - vis + 1 ))
+    [ "$TREETOP" -lt 0 ] && TREETOP=0
+    hdr=$([ "$TREEFOCUS" = 1 ] && echo "── TREE ◀ tab ──" || echo "── tree · tab ▶ ──")
+    addline P 0 0 "$hdr"
+    for (( li=TREETOP; li<TREETOP+vis && li<TLN; li++ )); do
+      row=$(( 1 + li - TREETOP )); st=0
+      [ "${TREF[li]}" = "$centref" ] && st=2
+      if [ "$TREEFOCUS" = 1 ] && [ "$li" = "$cline" ]; then st=$([ "$st" = 2 ] && echo 3 || echo 1); fi
+      mk="  "
+      { [ "$TREEFOCUS" = 1 ] && [ "$li" = "$cline" ]; } && mk="▸ "
+      { [ "$mk" = "  " ] && [ "${TREF[li]}" = "$centref" ]; } && mk="◆ "
+      # clamp indentation so a deep spine doesn't push the label off the narrow
+      # panel; past the cap, show a '·' guide so depth is still legible.
+      vdep=${TDEP[li]}; gpfx=""
+      if [ "$vdep" -gt "$TREEMAXIND" ]; then gpfx="·"; vdep=$TREEMAXIND; fi
+      printf -v ind '%*s' "$vdep" ''
+      addline P "$row" "$st" "${mk}${ind}${gpfx}${TTXT[li]}"
+    done
+    PATHREF=$([ "$TREEFOCUS" = 1 ] && echo "$CURREF" || echo "$centref")
+    ref_path_set "$PATHREF"
+  fi
+
+  printf '%s\n' "${lines[@]}" | awk -f "$REND"
+}
+
+# derive the top-left camX/camY (floats) from the centre CX/CY for the current
+# zoom. Called every draw; because CX/CY are canonical, zoom in/out returns to the
+# exact same view and projection stays sub-cell accurate.
+derive_cam() {
+  local pw=0; [ "$PANEL" = 1 ] && pw=$PANELW
+  read -r camX camY < <(awk -v cx="$CX" -v cy="$CY" -v C="$COLS" -v R="$CANVAS_ROWS" -v pw="$pw" \
+    -v z="${ZOOMS[ZI]}" 'BEGIN{
+      off = (pw>0 ? pw+1 : 0); cw = C - off       # canvas region starts after the divider
+      printf "%.4f %.4f\n", cx - (off + cw/2)/z, cy - (R/2)/z }')
+}
+
+# centre CX so that world-x WX (typically a box's left edge) lands ~6 cells inside
+# the canvas region — panel-aware, so framed boxes never hide behind the panel.
+cx_for_left() {
+  local pw=0; [ "$PANEL" = 1 ] && pw=$PANELW
+  awk -v x="$1" -v C="$COLS" -v pw="$pw" -v z="${ZOOMS[ZI]}" \
+    'BEGIN{ off=(pw>0?pw+1:0); cw=C-off; printf "%d", x + (cw/2 - 6)/z }'
+}
+
+# centre the view so the root sits near the left edge, vertically centred.
+center_on_root() {
+  CY=$(( mWY[0] + mLH[0] / 2 ))
+  CX=$(cx_for_left "${mWX[0]}")
+}
+
+# world bounding box over model ids [lo,hi): sets BBX0 BBY0 BBX1 BBY1.
+model_bbox() {
+  local lo=$1 hi=$2 i b
+  BBX0=2000000000; BBY0=2000000000; BBX1=-2000000000; BBY1=-2000000000
+  for (( i=lo; i<hi; i++ )); do
+    [ "${mWX[i]}" -lt "$BBX0" ] && BBX0=${mWX[i]}
+    [ "${mWY[i]}" -lt "$BBY0" ] && BBY0=${mWY[i]}
+    b=$(( mWX[i] + mWW[i] )); [ "$b" -gt "$BBX1" ] && BBX1=$b
+    b=$(( mWY[i] + mLH[i] )); [ "$b" -gt "$BBY1" ] && BBY1=$b
+  done
+}
+
+# fit a world bbox into the canvas: pick the LARGEST zoom-ladder step whose
+# projection fits with a margin, then centre the camera on the bbox. This "uses the
+# whole screen" instead of leaving content crammed into a tiny dense cluster.
+fit_view() {
+  local minx=$1 miny=$2 maxx=$3 maxy=$4 pw=0
+  [ "$PANEL" = 1 ] && pw=$PANELW
+  ZI=$(awk -v minx="$minx" -v miny="$miny" -v maxx="$maxx" -v maxy="$maxy" \
+           -v C="$COLS" -v R="$CANVAS_ROWS" -v pw="$pw" -v zl="${ZOOMS[*]}" 'BEGIN{
+    n=split(zl, Z, " ")
+    off=(pw>0?pw+1:0); cw=(C-off)*0.88; ch=R*0.88
+    w=maxx-minx; if(w<1)w=1; h=maxy-miny; if(h<1)h=1
+    best=0
+    for(i=1;i<=n;i++) if(w*Z[i]<=cw && h*Z[i]<=ch) best=i-1
+    print best }')
+  CX=$(( (minx + maxx) / 2 )); CY=$(( (miny + maxy) / 2 ))
+}
+# fit the whole base structure (no drill) into view.
+fit_structure() { model_bbox 0 "$M"; fit_view "$BBX0" "$BBY0" "$BBX1" "$BBY1"; }
+
+# --- virtualized window materialization for huge containers ---------------
+# add a sparse checkpoint (element idx -> byte offset) for backward scrolling
+add_ckpt() {
+  local id=$1 idx=$2 off=$3
+  (( idx % CKSTEP != 0 )) && return
+  case " ${mCkptN[id]} " in *" $idx:"*) return ;; esac
+  mCkptN[id]="${mCkptN[id]} $idx:$off"
+}
+
+# materialize_window ID WANT COUNT -> WIN[] (flagtext rows), WIN_GOT
+# reads only the elements in [WANT, WANT+COUNT): seeks to the nearest checkpoint
+# at/below WANT, then scans forward. Work is bounded by COUNT + CKSTEP.
+declare -a WIN
+materialize_window() {
+  local id=$1 want=$2 count=$3
+  WIN=(); WIN_GOT=0
+  local isobj=0; [ "${mType[id]}" = object ] && isobj=1
+  local idx=0 off=${mFirstOff[id]} best=-1 ck bi bo
+  for ck in ${mCkptN[id]}; do
+    bi=${ck%%:*}; bo=${ck##*:}
+    if [ "$bi" -le "$want" ] && [ "$bi" -gt "$best" ]; then best=$bi; off=$bo; fi
+  done
+  [ "$best" -ge 0 ] && idx=$best
+  local guard=0 c effGN nextOff name
+  while [ "$WIN_GOT" -lt "$count" ]; do
+    scan_slice "$off" 1 "$isobj"
+    [ "$GN" -eq 0 ] && { [ "$GCLOSED" = 1 ] && mDoneN[id]=1; break; }
+    if [ "$GCLOSED" = 0 ] && [ "${gcPart[GN-1]}" = 1 ] && [ "$GN" -gt 1 ]; then
+      effGN=$(( GN - 1 )); nextOff=${gcEoff[GN-1]}
+    else
+      effGN=$GN; nextOff=$GRESUME
+    fi
+    for (( c=0; c<effGN; c++ )); do
+      add_ckpt "$id" "$idx" "${gcEoff[c]}"
+      if [ "$idx" -ge "$want" ] && [ "$WIN_GOT" -lt "$count" ]; then
+        if [ "$isobj" = 1 ]; then name="${gcKey[c]}: ${gcPrev[c]}"; else name="[$idx] ${gcPrev[c]}"; fi
+        WIN[WIN_GOT]="0${name:0:$(( MAXW - 2 ))}"; WIN_GOT=$(( WIN_GOT + 1 ))
+      fi
+      idx=$(( idx + 1 ))
+    done
+    [ "$idx" -gt "${mKnownN[id]}" ] && mKnownN[id]=$idx
+    [ "$GCLOSED" = 1 ] && { mDoneN[id]=1; break; }
+    off=$nextOff
+    guard=$(( guard + 1 )); [ "$guard" -gt 200000 ] && break
+  done
+}
+
+# one-entry cache so a redraw without panning doesn't re-scan
+HMZ_KEY=""
+materialize_window_cached() {
+  local key="$1:$2:$3"
+  if [ "$key" != "$HMZ_KEY" ]; then
+    materialize_window "$1" "$2" "$3"
+    HMZ_KEY=$key; HMZ_WIN=("${WIN[@]}"); HMZ_GOT=$WIN_GOT
+  else
+    WIN=("${HMZ_WIN[@]}"); WIN_GOT=$HMZ_GOT
+  fi
+}
+
+# re-read the terminal size in cells (after a font change or window resize)
+read_size() {
+  COLS=$(tput cols 2>/dev/null || echo 100)
+  ROWS=$(tput lines 2>/dev/null || echo 30)
+  CANVAS_ROWS=$(( ROWS - 1 ))
+}
+
+# Best-effort: ask the terminal to shrink its font so the canvas gets more
+# cells = higher resolution. Only acts if the terminal answers the font query
+# (xterm/urxvt do; VTE/others don't), and the old font is restored on exit, so
+# unsupported terminals are simply left untouched. Disable with CANVAS_NOFONT=1.
+FONT_CHANGED=0; FONT_OLD=""
+: "${CANVAS_FONT_PT:=8}"
+shrink_font() {
+  [ -n "${CANVAS_NOFONT:-}" ] && return
+  { true; } 2>/dev/null >/dev/tty || return                  # no usable controlling tty
+  local reply
+  printf '\e]50;?\a' >/dev/tty 2>/dev/null
+  IFS= read -rs -d $'\a' -t 0.4 reply </dev/tty 2>/dev/null || return  # no reply -> unsupported
+  case "$reply" in *';'*) ;; *) return ;; esac
+  FONT_OLD=${reply#*;}                                        # strip ESC ] 50 ;
+  local newf
+  case "$FONT_OLD" in
+    *size=*) newf="${FONT_OLD%size=*}size=${CANVAS_FONT_PT}" ;;
+    xft:*)   newf="${FONT_OLD}:size=${CANVAS_FONT_PT}" ;;
+    *)       newf="xft:${FONT_OLD}:size=${CANVAS_FONT_PT}" ;;
+  esac
+  printf '\e]50;%s\a' "$newf" >/dev/tty 2>/dev/null
+  FONT_CHANGED=1
+}
+restore_font() { [ "$FONT_CHANGED" = 1 ] && printf '\e]50;%s\a' "$FONT_OLD" >/dev/tty 2>/dev/null; }
+
+# --- search (grep) + jump-to-offset -------------------------------------------
+declare -A OFF2ID=()                     # value byte-offset -> model node id
+declare -a MATCHES=() INDEXED=()
+MIDX=0; STATUSMSG=""; ENTERED=-1     # id of the huge list being browsed, or -1
+# SEL = the SELECTED element index inside ENTERED (the canonical "what am I looking
+# at" in a huge list). It is authoritative: scroll/goto/tree/search move SEL and the
+# camera FOLLOWS it (sel_recenter); ↵ and 'e' act on SEL and the highlight lands on
+# SEL. Deriving the selection from the camera instead was the bug — once a drill
+# repositioned the camera, ↵/e/goto picked a different (wrong) element.
+SEL=0
+# drill-in: when browsing a huge list, ↵ expands the SELECTED element into its own
+# node-link subtree. DRILL = that subtree's root node id (or -1); the subtree's nodes
+# occupy ids [PREDRILL_M, M) and are torn down by collapse_drill.
+DRILL=-1; PREDRILL_M=0
+
+# clamp SEL into the entered list's bounds and re-frame the camera so the selected
+# element sits at the vertical screen centre (panel-aware horizontally).
+sel_clamp() {
+  local hi=$(( ${mNRows[ENTERED]:-1} - 1 )); [ "$hi" -lt 0 ] && hi=0
+  [ "$SEL" -lt 0 ] && SEL=0; [ "$SEL" -gt "$hi" ] && SEL=$hi
+}
+sel_recenter() {
+  [ "$ENTERED" -lt 0 ] && return
+  sel_clamp
+  CX=$(cx_for_left "${mWX[ENTERED]}")
+  CY=$(( mWY[ENTERED] + 1 + SEL ))
+}
+
+# enter the huge list nearest the camera (so ↵ opens the one you're looking at)
+enter_huge() {
+  collapse_drill
+  local best=-1 bestd=2000000000 i d
+  for (( i=0; i<M; i++ )); do
+    [ "${mHuge[i]:-0}" = 1 ] || continue
+    d=$(( mWX[i] - CX )); [ "$d" -lt 0 ] && d=$(( -d ))
+    [ "$d" -lt "$bestd" ] && { bestd=$d; best=$i; }
+  done
+  [ "$best" -lt 0 ] && { STATUSMSG="no list here"; return; }
+  ENTERED=$best; SEL=0; sel_recenter
+  STATUSMSG="browsing ${mHugeLabel[best]} — j/k scroll · g goto# · ↵ drill · Bksp back"
+}
+build_offmap() { local i; OFF2ID=(); for (( i=0; i<M; i++ )); do OFF2ID[${mValOff[i]}]=$i; done; }
+
+# --- linked tree side panel --------------------------------------------------
+# format a count into HN (no fork): 1.4M / 17k / 42; d=1 exact else prefix "~".
+human_set() {
+  local n=$1 d=$2 p=""; [ "$d" = 0 ] && p="~"
+  if   [ "$n" -ge 1000000 ]; then HN="${p}$(( n / 1000000 )).$(( (n % 1000000) / 100000 ))M"
+  elif [ "$n" -ge 1000 ];    then HN="${p}$(( n / 1000 ))k"
+  else HN="${p}${n}"; fi
+}
+
+# centre the canvas on a node (used when picking a node in the tree).
+look_at_node() {
+  local id=$1
+  CX=$(( mWX[id] + mWW[id] / 2 ))
+  CY=$(( mWY[id] + mLH[id] / 2 ))
+}
+
+# JSONPath-ish breadcrumb for a model node, e.g. $.records[15].tags -> sets NP.
+node_path() {
+  local id=$1 seg path=""
+  while [ "$id" -ge 0 ]; do
+    if   [ "${mPar[id]}" -lt 0 ];               then seg="\$"
+    elif [ "${mType[mPar[id]]:-}" = array ];    then seg="[${mIdx[id]}]"
+    else seg=".${mKey[id]:-?}"; fi
+    path="$seg$path"; id=${mPar[id]}
+  done
+  NP="$path"
+}
+# breadcrumb for a tree ref ("n<id>" node or "e<list>:<idx>" element) -> sets CRUMB.
+ref_path_set() {
+  case "$1" in
+    e*) local r=${1#e}; node_path "${r%%:*}"; CRUMB="${NP}[${r#*:}]" ;;
+    n*) node_path "${1#n}"; CRUMB="$NP" ;;
+    *)  CRUMB="" ;;
+  esac
+}
+
+# DFS the model into a flat indented outline of REFS (TREF/TDEP/TTXT, TLN rows).
+# Model children come from mPar; when we reach the ENTERED huge list we splice in a
+# window of its actual elements (so the 1M items show up in the tree), with the
+# drilled element expanded inline. TKIDS is global so the recursion can see it.
+declare -A TKIDS=()
+build_tree() {
+  TKIDS=(); local i p
+  for (( i=1; i<M; i++ )); do p=${mPar[i]}; TKIDS[$p]="${TKIDS[$p]:-} $i"; done
+  TLN=0; _tdfs_node 0 0
+}
+_tdfs_node() {
+  local id=$1 dep=$2 c name sfx cnt
+  if [ "${mHuge[id]:-0}" = 1 ]; then
+    if [ "${mDoneN[id]:-0}" = 1 ]; then cnt=${mKnownN[id]}; else cnt=${mNRows[id]}; fi
+    human_set "$cnt" "${mDoneN[id]:-0}"; sfx="[$HN]"
+  elif [ "${mType[id]}" = array ]; then sfx="[${mNRows[id]:-0}]"
+  else sfx="{${mNRows[id]:-0}}"; fi
+  if [ "${mPar[id]}" -lt 0 ]; then name="root"
+  elif [ "${mType[mPar[id]]:-}" = array ]; then name="[${mIdx[id]}]"
+  else name="${mKey[id]:-?}"; fi
+  TREF[TLN]="n$id"; TDEP[TLN]=$dep; TTXT[TLN]="$name $sfx"; TLN=$(( TLN + 1 ))
+  if [ "$id" = "${ENTERED:-Z}" ] && [ "${mHuge[id]:-0}" = 1 ]; then
+    _tdfs_elements "$id" $(( dep + 1 ))                 # splice element window here
+  else
+    for c in ${TKIDS[$id]:-}; do _tdfs_node "$c" $(( dep + 1 )); done
+  fi
+}
+# list a window of the entered list's elements as flat leaves; the drilled element
+# expands inline into its subtree at its position.
+_tdfs_elements() {
+  local id=$1 dep=$2 focus=$SEL n0 n1 idx rel prev hi drilled=-1
+  # when drilled, centre the element window on the drilled index.
+  [ "$DRILL" -ge 0 ] && [ "${mPar[DRILL]}" = "$id" ] && { drilled=${mIdx[DRILL]}; focus=$drilled; }
+  hi=$(( ${mKnownN[id]:-1} - 1 )); [ "$hi" -lt 0 ] && hi=0
+  n0=$(( focus - 18 )); [ "$n0" -lt 0 ] && n0=0
+  n1=$(( focus + 18 )); [ "$n1" -gt "$hi" ] && n1=$hi
+  for (( idx=n0; idx<=n1; idx++ )); do
+    if [ "$idx" = "$drilled" ]; then
+      _tdfs_node "$DRILL" "$dep"
+    else
+      rel=$(( idx - ENT_W ))
+      if [ "$rel" -ge 0 ] && [ "$rel" -lt "${WIN_GOT:-0}" ]; then prev="${WIN[rel]:1}"; else prev="[$idx]"; fi
+      TREF[TLN]="e$id:$idx"; TDEP[TLN]=$dep; TTXT[TLN]="$prev"; TLN=$(( TLN + 1 ))
+    fi
+  done
+}
+
+# the model node whose centre is nearest the screen centre — what the canvas looks at.
+centered_node() {
+  local i best=0 bestd=2000000000 cx cy dx dy d
+  for (( i=0; i<M; i++ )); do
+    cx=$(( mWX[i] + mWW[i] / 2 )); cy=$(( mWY[i] + mLH[i] / 2 ))
+    dx=$(( cx - CX )); [ "$dx" -lt 0 ] && dx=$(( -dx ))
+    dy=$(( cy - CY )); [ "$dy" -lt 0 ] && dy=$(( -dy ))
+    d=$(( dx + dy )); [ "$d" -lt "$bestd" ] && { bestd=$d; best=$i; }
+  done
+  CENTERED=$best
+}
+# the ref the canvas is currently looking at (a list element when browsing, else a node)
+cur_centered_ref() {
+  if [ "$ENTERED" -ge 0 ] && [ "$DRILL" -lt 0 ]; then printf 'e%s:%s' "$ENTERED" "$SEL"
+  else centered_node; printf 'n%s' "$CENTERED"; fi
+}
+
+# outline line index of a ref (or -1)
+tree_line_of() { local ref=$1 i; for (( i=0; i<TLN; i++ )); do [ "${TREF[i]}" = "$ref" ] && { printf '%s' "$i"; return; }; done; printf '%s' -1; }
+
+# point the canvas at a ref: a node centres on it; an element scrolls its list there.
+goto_ref() {
+  local ref=$1 lid idx id a inlist
+  case "$ref" in
+    e*) ref=${ref#e}; lid=${ref%%:*}; idx=${ref#*:}
+        ENTERED=$lid; SEL=$idx; sel_recenter ;;
+    n*) id=${ref#n}
+        if [ "$ENTERED" -ge 0 ]; then                  # leaving the list? (not it or a descendant)
+          a=$id; inlist=0
+          while [ "$a" -ge 0 ]; do [ "$a" = "$ENTERED" ] && { inlist=1; break; }; a=${mPar[a]}; done
+          [ "$inlist" = 0 ] && { collapse_drill; ENTERED=-1; }
+        fi
+        look_at_node "$id" ;;
+  esac
+}
+
+# move the tree cursor by DIR rows and follow it on the canvas.
+tree_move() {
+  local dir=$1 cur t
+  cur=$(tree_line_of "$CURREF"); [ "$cur" -lt 0 ] && cur=0
+  t=$(( cur + dir )); [ "$t" -lt 0 ] && t=0; [ "$t" -ge "$TLN" ] && t=$(( TLN - 1 ))
+  CURREF=${TREF[t]}; goto_ref "$CURREF"
+}
+
+# ↵ in tree focus: enter a huge list, or drill a list element (records[15].tags…).
+tree_enter() {
+  local id lid idx ref=$CURREF
+  case "$ref" in
+    e*) ref=${ref#e}; lid=${ref%%:*}; idx=${ref#*:}
+        ENTERED=$lid; SEL=$idx; drill_into "$lid" "$idx"; [ "$DRILL" -ge 0 ] && CURREF="n$DRILL" ;;
+    n*) id=${ref#n}
+        if [ "${mHuge[id]:-0}" = 1 ] && [ "$id" != "${ENTERED:-Z}" ]; then
+          ENTERED=$id; SEL=0; sel_recenter; CURREF="e$id:0"
+          STATUSMSG="entered ${mHugeLabel[id]} — j/k walk items · ↵ drill · e expand-all"
+        fi ;;
+  esac
+}
+
+# resolve element IDX of huge list ID to its byte offsets (seek nearest checkpoint,
+# scan forward; bounded). Sets ELEM_OFF / ELEM_VOFF / ELEM_TYPE.
+elem_offset() {
+  local id=$1 target=$2 isobj=0; [ "${mType[id]}" = object ] && isobj=1
+  local idx=0 off=${mFirstOff[id]} best=-1 ck bi bo c effGN nextOff guard=0
+  for ck in ${mCkptN[id]}; do bi=${ck%%:*}; bo=${ck##*:}
+    if [ "$bi" -le "$target" ] && [ "$bi" -gt "$best" ]; then best=$bi; off=$bo; fi; done
+  [ "$best" -ge 0 ] && idx=$best
+  ELEM_OFF=-1; ELEM_VOFF=-1; ELEM_TYPE=""
+  while :; do
+    scan_slice "$off" 1 "$isobj"
+    [ "$GN" -eq 0 ] && break
+    if [ "$GCLOSED" = 0 ] && [ "${gcPart[GN-1]}" = 1 ] && [ "$GN" -gt 1 ]; then effGN=$(( GN-1 )); nextOff=${gcEoff[GN-1]}; else effGN=$GN; nextOff=$GRESUME; fi
+    for (( c=0; c<effGN; c++ )); do
+      add_ckpt "$id" "$idx" "${gcEoff[c]}"
+      if [ "$idx" = "$target" ]; then ELEM_OFF=${gcEoff[c]}; ELEM_VOFF=${gcValOff[c]}; ELEM_TYPE=${gcType[c]}; return; fi
+      idx=$(( idx + 1 ))
+    done
+    [ "$GCLOSED" = 1 ] && break
+    off=$nextOff; guard=$(( guard + 1 )); [ "$guard" -gt 200000 ] && break
+  done
+}
+
+# tear down any active drill subtree (restore the model to its pre-drill size) and
+# re-frame the camera back onto the list (keeping the scroll position) so we don't
+# end up parked on empty canvas where the subtree used to be.
+collapse_drill() {
+  [ "$DRILL" -lt 0 ] && return
+  M=$PREDRILL_M; DRILL=-1; build_offmap
+  [ "$ENTERED" -ge 0 ] && sel_recenter      # land back on the selected element
+}
+
+# leave the windowed list and fit the whole structure back into view.
+exit_list() {
+  [ "$ENTERED" -lt 0 ] && return
+  ENTERED=-1
+  fit_structure
+}
+
+# expand element IDX of huge list ID into its own node-link subtree, laid out to
+# the right of the list and edged from the focused row. Nested huge arrays inside
+# the element stay virtualized (rendered as summary nodes).
+drill_into() {
+  local id=$1 idx=$2 extra=${3:-4} k cur kk maxd
+  collapse_drill
+  elem_offset "$id" "$idx"
+  case "$ELEM_TYPE" in
+    object|array) ;;
+    "") STATUSMSG="couldn't read element $idx"; return ;;
+    *) STATUSMSG="element $idx is a scalar — nothing to expand"; return ;;
+  esac
+  PREDRILL_M=$M
+  k=$M; M=$(( M + 1 ))
+  mPar[k]=$id; mDepth[k]=$(( mDepth[id] + 1 )); mType[k]=$ELEM_TYPE
+  mKey[k]="[$idx]"; mIdx[k]=$idx; mValOff[k]=$ELEM_VOFF; mHandleRow[k]=2   # = summary handle row
+  mKids[k]=""; mHuge[k]=0; mNRows[k]=1; mRows[k]="0[$idx] …"; mWW[k]=$MINW; mWH[k]=3; mLH[k]=3
+  maxd=$(( mDepth[k] + extra ))                      # bound the drilled subtree depth
+  local queue=("$k")
+  while [ ${#queue[@]} -gt 0 ] && [ "$M" -lt "$MAXNODES" ]; do
+    cur=${queue[0]}; queue=("${queue[@]:1}")
+    case "${mType[cur]}" in object|array) ;; *) continue;; esac
+    expand_container "$cur"
+    for kk in "${NEWKIDS[@]}"; do
+      [ "${mDepth[kk]}" -lt "$maxd" ] && [ "$M" -lt "$MAXNODES" ] && queue+=("$kk")
+    done
+  done
+  cursorY=$(( mWY[id] + 1 )); _lay "$k"              # place subtree beside the list summary
+  DRILL=$k; build_offmap
+  # frame the freshly expanded subtree so it FILLS the screen ("infinite space"):
+  # fit-to-zoom over the subtree bbox, centred, instead of pinning it tiny by the list.
+  model_bbox "$PREDRILL_M" "$M"
+  fit_view "$BBX0" "$BBY0" "$BBX1" "$BBY1"
+  STATUSMSG="expanded [$idx] — Bksp to close"
+}
+
+# ↵ drills ONLY the element you're watching; 'e' opens its ENTIRE nested structure
+# (deep expand, still bounded by MAXNODES) for a full overview.
+expand_all() {
+  local lid idx
+  if [ "$TREEFOCUS" = 1 ]; then                       # expand the element under the tree cursor
+    case "$CURREF" in
+      e*) lid=${CURREF#e}; idx=${lid#*:}; lid=${lid%%:*}
+          ENTERED=$lid; SEL=$idx; drill_into "$lid" "$idx" 30; [ "$DRILL" -ge 0 ] && CURREF="n$DRILL"
+          STATUSMSG="expanded [$idx] fully — Bksp to close"; return ;;
+    esac
+  fi
+  if [ "$ENTERED" -ge 0 ]; then
+    drill_into "$ENTERED" "$SEL" 30
+    STATUSMSG="expanded [$SEL] fully — Bksp to close"
+  else
+    STATUSMSG="open a list with ↵ first, then 'e' expands it fully"
+  fi
+}
+
+# grep_find PATTERN -> MATCHES[] byte offsets (literal match; grep streams the
+# whole file fast regardless of size — this is the "grep finds it instantly" win)
+grep_find() {
+  MATCHES=(); MIDX=0
+  local line
+  while IFS= read -r line; do MATCHES+=("${line%%:*}"); done < <(grep -aboF -m 2000 -- "$1" "$FILE" 2>/dev/null)
+}
+
+# within a huge container, find the element index whose bytes contain O. Seeks to
+# the nearest checkpoint at/below O, then scans forward (bounded; instant once
+# indexed). Side effects (new checkpoints) persist — must NOT run in a subshell.
+locate_in_huge() {
+  local id=$1 O=$2 isobj=0; [ "${mType[id]}" = object ] && isobj=1
+  local idx=0 off=${mFirstOff[id]} best=-1 ck bi bo
+  for ck in ${mCkptN[id]}; do
+    bi=${ck%%:*}; bo=${ck##*:}
+    if [ "$bo" -le "$O" ] && [ "$bi" -gt "$best" ]; then best=$bi; off=$bo; fi
+  done
+  [ "$best" -ge 0 ] && idx=$best
+  FOUND_IDX=$idx
+  local guard=0 c effGN nextOff stop
+  while :; do
+    scan_slice "$off" 1 "$isobj"
+    [ "$GN" -eq 0 ] && break
+    if [ "$GCLOSED" = 0 ] && [ "${gcPart[GN-1]}" = 1 ] && [ "$GN" -gt 1 ]; then effGN=$(( GN-1 )); nextOff=${gcEoff[GN-1]}; else effGN=$GN; nextOff=$GRESUME; fi
+    stop=0
+    for (( c=0; c<effGN; c++ )); do
+      add_ckpt "$id" "$idx" "${gcEoff[c]}"
+      if [ "${gcEoff[c]}" -le "$O" ]; then FOUND_IDX=$idx; else stop=1; break; fi
+      idx=$(( idx + 1 ))
+    done
+    [ "$idx" -gt "${mKnownN[id]}" ] && mKnownN[id]=$idx
+    [ "$stop" = 1 ] && break
+    [ "$GCLOSED" = 1 ] && { mDoneN[id]=1; break; }
+    off=$nextOff
+    guard=$(( guard + 1 )); [ "$guard" -gt 200000 ] && break
+  done
+}
+
+# locate OFF -> JUMP_ID (model node containing it) + JUMP_IDX (element index if it
+# landed inside a huge list, else -1). Descends the modeled tree from the root.
+locate() {
+  local O=$1 cur=0 guard=0 c found nid
+  JUMP_ID=0; JUMP_IDX=-1
+  while :; do
+    if [ "${mHuge[cur]:-0}" = 1 ]; then locate_in_huge "$cur" "$O"; JUMP_ID=$cur; JUMP_IDX=$FOUND_IDX; return; fi
+    scan_slice "${mValOff[cur]}" 0 0
+    found=-1
+    for (( c=0; c<GN; c++ )); do
+      if [ "$O" -ge "${gcEoff[c]}" ] && [ "$O" -lt "$(( gcValOff[c] + gcLen[c] ))" ]; then found=$c; break; fi
+    done
+    [ "$found" -lt 0 ] && { JUMP_ID=$cur; return; }
+    case "${gcType[found]}" in
+      object|array) nid=${OFF2ID[${gcValOff[found]}]:-}
+        if [ -n "$nid" ]; then cur=$nid; else JUMP_ID=$cur; return; fi ;;
+      *) JUMP_ID=$cur; return ;;
+    esac
+    guard=$(( guard + 1 )); [ "$guard" -gt 64 ] && { JUMP_ID=$cur; return; }
+  done
+}
+
+jump_camera() {
+  local id=$JUMP_ID
+  if [ "$JUMP_IDX" -ge 0 ]; then CY=$(( mWY[id] + 1 + JUMP_IDX )); else CY=$(( mWY[id] + mLH[id] / 2 )); fi
+  CX=$(cx_for_left "${mWX[id]}")
+}
+
+jump_to_match() {
+  [ "${#MATCHES[@]}" -eq 0 ] && { STATUSMSG="no matches"; return; }
+  (( MIDX < 0 )) && MIDX=$(( ${#MATCHES[@]} - 1 ))
+  (( MIDX >= ${#MATCHES[@]} )) && MIDX=0
+  local O=${MATCHES[MIDX]}
+  collapse_drill
+  locate "$O"
+  if [ "$JUMP_IDX" -ge 0 ]; then ENTERED=$JUMP_ID; SEL=$JUMP_IDX; sel_recenter   # open the list the match lives in, select it
+  else jump_camera; fi
+  STATUSMSG="match $(( MIDX + 1 ))/${#MATCHES[@]} @byte $O"
+}
+
+# --- path-based goto: "records[23].child.child" / "$.meta.schema" -------------
+# parse a JSONPath-ish string into PSEG[] entries, each "k <key>" or "i <index>".
+parse_path() {
+  local s=$1 key idx
+  PSEG=()
+  s=${s#\$}                                   # optional leading $
+  while [ -n "$s" ]; do
+    case "$s" in
+      .*)  s=${s#.} ;;                          # skip a dot
+      \[*) s=${s#\[}; idx=${s%%\]*}; s=${s#*\]}
+           [ -n "$idx" ] && PSEG+=("i $idx") ;;
+      *)   key=${s%%[.[]*}                       # key up to next . or [
+           if [ "$key" = "$s" ]; then s=""; else s=${s:${#key}}; fi
+           [ -n "$key" ] && PSEG+=("k $key") ;;
+    esac
+  done
+}
+
+# the model node child of CUR matching a path segment, or -1. Objects match by key,
+# arrays by element index. Scalar children aren't nodes (returns -1 → walk stops).
+find_child_node() {
+  local cur=$1 kind=$2 val=$3 i
+  for (( i=0; i<M; i++ )); do
+    [ "${mPar[i]}" = "$cur" ] || continue
+    if [ "$kind" = k ]; then [ "${mKey[i]}" = "$val" ] && { printf '%s' "$i"; return; }
+    else [ "${mIdx[i]}" = "$val" ] && { printf '%s' "$i"; return; }; fi
+  done
+  printf '%s' -1
+}
+
+# navigate to a path from the root: descend modeled containers by key/index, drilling
+# the huge-list element when the path crosses one (so its subtree gets modeled), then
+# fit on the target. Bare element indices are handled by the caller.
+goto_path() {
+  parse_path "$1"
+  [ "${#PSEG[@]}" -eq 0 ] && { STATUSMSG="empty path"; return; }
+  collapse_drill; ENTERED=-1
+  local cur=0 last=$(( ${#PSEG[@]} - 1 )) si seg kind val child
+  for (( si=0; si<=last; si++ )); do
+    seg=${PSEG[si]}; kind=${seg%% *}; val=${seg#* }
+    if [ "${mHuge[cur]:-0}" = 1 ]; then            # cur is a huge list → need an index
+      [ "$kind" = i ] || { STATUSMSG="expected [index] after ${mHugeLabel[cur]}"; sel_recenter 2>/dev/null; return; }
+      ENTERED=$cur; SEL=$val; sel_clamp
+      if [ "$si" -eq "$last" ]; then ZI=5; sel_recenter; STATUSMSG="went to $1"; return; fi
+      drill_into "$cur" "$SEL" 30
+      [ "$DRILL" -lt 0 ] && { STATUSMSG="can't descend into [$SEL]"; return; }
+      cur=$DRILL
+    else
+      child=$(find_child_node "$cur" "$kind" "$val")
+      if [ "$child" -lt 0 ]; then
+        STATUSMSG="path stops here: no $([ "$kind" = k ] && echo ".$val" || echo "[$val]")"
+        ZI=5; CX=$(cx_for_left "${mWX[cur]}"); CY=$(( mWY[cur] + mLH[cur] / 2 )); return
+      fi
+      cur=$child
+    fi
+  done
+  # ended on a container node: centre on the TARGET at a readable zoom (1.0x), with it
+  # framed to the left so its own children flow rightward — do NOT zoom way out to fit
+  # the entire 30-level spine that drilling expanded.
+  if [ "${mHuge[cur]:-0}" = 1 ]; then ENTERED=$cur; SEL=0; ZI=5; sel_recenter
+  else ZI=5; CX=$(cx_for_left "${mWX[cur]}"); CY=$(( mWY[cur] + mLH[cur] / 2 )); fi
+  STATUSMSG="went to $1"
+}
+
+# --- one-time index for fast deep jumps / search landing (cached to sidecar) ---
+# A full pass over a huge container, recording a checkpoint every CKSTEP elements
+# plus the exact element count. Honors the "indexing" idea: pay O(file) once, then
+# arbitrary jumps are O(CKSTEP). Result is cached in <FILE>.cvidx.<offset>.
+load_index() {
+  local id=$1 sc="${FILE}.cvidx.${mValOff[id]}" cnt ck
+  [ -f "$sc" ] || return 1
+  { read -r cnt; IFS= read -r ck; } < "$sc" || return 1
+  [ -n "$cnt" ] || return 1
+  mKnownN[id]=$cnt; mDoneN[id]=1; mCkptN[id]=" $ck"; mWH[id]=$(( cnt + 2 )); mNRows[id]=$cnt; INDEXED[$id]=1
+}
+build_index() {
+  local id=$1
+  [ "${INDEXED[$id]:-0}" = 1 ] && return
+  load_index "$id" && return
+  local isobj=0; [ "${mType[id]}" = object ] && isobj=1
+  local idx=0 off=${mFirstOff[id]} c effGN nextOff ckpts="0:${mFirstOff[id]}"
+  while :; do
+    scan_slice "$off" 1 "$isobj"
+    [ "$GN" -eq 0 ] && break
+    if [ "$GCLOSED" = 0 ] && [ "${gcPart[GN-1]}" = 1 ] && [ "$GN" -gt 1 ]; then effGN=$(( GN-1 )); nextOff=${gcEoff[GN-1]}; else effGN=$GN; nextOff=$GRESUME; fi
+    for (( c=0; c<effGN; c++ )); do (( idx % CKSTEP == 0 )) && ckpts="$ckpts $idx:${gcEoff[c]}"; idx=$(( idx + 1 )); done
+    printf '\r\e[7m indexing… %d elements \e[0m' "$idx" 2>/dev/null >/dev/tty || true
+    [ "$GCLOSED" = 1 ] && break
+    off=$nextOff
+  done
+  mKnownN[id]=$idx; mDoneN[id]=1; mCkptN[id]="$ckpts"; mWH[id]=$(( idx + 2 )); mNRows[id]=$idx; INDEXED[$id]=1
+  printf '%s\n%s\n' "$idx" "$ckpts" > "${FILE}.cvidx.${mValOff[id]}" 2>/dev/null
+}
+build_all_index() { local i; for (( i=0; i<M; i++ )); do [ "${mHuge[i]:-0}" = 1 ] && build_index "$i"; done; }
+
+# ---------- debug: build the on-disk index for huge containers ----------
+if [ "${2:-}" = "--index" ]; then
+  COLS=120; ROWS=30; CANVAS_ROWS=29
+  build_model; layout; build_offmap
+  build_all_index
+  for (( i=0; i<M; i++ )); do
+    [ "${mHuge[i]:-0}" = 1 ] && echo "huge node $i: count=${mKnownN[i]} checkpoints=$(( $(echo ${mCkptN[i]} | wc -w) ))"
+  done
+  exit 0
+fi
+
+# ---------- debug: resolve a search pattern to a model location ----------
+if [ "${2:-}" = "--find" ]; then
+  COLS=120; ROWS=30; CANVAS_ROWS=29
+  build_model; layout; build_offmap
+  grep_find "$3"
+  echo "matches=${#MATCHES[@]}  first offsets: ${MATCHES[*]:0:5}"
+  if [ "${#MATCHES[@]}" -gt 0 ]; then
+    locate "${MATCHES[0]}"
+    echo "JUMP_ID=$JUMP_ID type=${mType[JUMP_ID]} huge=${mHuge[JUMP_ID]:-0} JUMP_IDX=$JUMP_IDX"
+  fi
+  exit 0
+fi
+
+# ---------- debug: resolve a path goto and report where it lands ----------
+if [ "${2:-}" = "--path" ]; then
+  COLS=120; ROWS=30; CANVAS_ROWS=29
+  build_model; layout; build_offmap
+  parse_path "$3"; echo "segments: ${PSEG[*]}"
+  goto_path "$3"
+  echo "STATUS: $STATUSMSG"
+  echo "ENTERED=$ENTERED SEL=$SEL DRILL=$DRILL ZI=$ZI ($([ "$ZI" -ge 0 ] && echo "${ZOOMS[ZI]}")x) CX=$CX CY=$CY"
+  if [ "$DRILL" -ge 0 ]; then node_path "$DRILL"; echo "drill root path=$NP type=${mType[DRILL]}"; fi
+  exit 0
+fi
+
+# ---------- non-interactive single frame ----------
+if [ "${2:-}" = "--frame" ]; then
+  camX=${3:-0}; camY=${4:-0}; ZI=${5:-5}
+  COLS=${6:-100}; ROWS=${7:-30}; CANVAS_ROWS=$(( ROWS - 1 ))
+  build_model; layout
+  if [ "${8:-}" = enter ]; then for (( i=0; i<M; i++ )); do [ "${mHuge[i]:-0}" = 1 ] && { ENTERED=$i; break; }; done; fi
+  if [ "$camX" = 0 ] && [ "$camY" = 0 ]; then center_on_root; derive_cam; fi
+  frame; echo
+  echo "nodes=$M zoom=${ZOOMS[ZI]} cam=($camX,$camY)"
+  exit 0
+fi
+
+# ---------- interactive ----------
+build_model; layout; build_offmap
+
+raw_mode() { stty -echo -icanon min 1 time 0 2>/dev/null; }
+cleanup() { stty sane 2>/dev/null; restore_font; printf '\e[?1000l\e[?1006l\e[?25h\e[?1049l'; }
+trap cleanup EXIT INT TERM
+printf '\e[?1049h\e[?25l\e[?1000h\e[?1006h'; raw_mode   # alt screen, hide cursor, SGR mouse on
+shrink_font; read_size; center_on_root
+
+WINCH=0
+trap 'WINCH=1' WINCH         # font change / window resize -> re-read size, redraw
+
+# read a line of input at the bottom row (temporarily cooked + visible cursor)
+prompt_line() {
+  printf '\e[%d;1H\e[K\e[7m%s\e[0m\e[?25h' "$ROWS" "$1"
+  stty icanon echo 2>/dev/null
+  IFS= read -r REPLY_LINE 2>/dev/null </dev/tty || REPLY_LINE=""
+  raw_mode; printf '\e[?25l'
+}
+
+status() {
+  local z=${ZOOMS[ZI]} line crumb=""
+  [ "$PANEL" = 1 ] && [ -n "$CRUMB" ] && crumb="  ${CRUMB}"
+  line="$(basename "$FILE")  z:${z}x${crumb}${STATUSMSG:+  · ${STATUSMSG}}   [↵ open/drill · e all · Bksp back · t tree · tab focus · wheel/jk scroll · / find · q]"
+  printf '\e[7m %-*.*s\e[0m' "$(( COLS - 1 ))" "$(( COLS - 1 ))" "$line"
+}
+
+draw() { derive_cam; printf '\e[H'; frame; printf '\n'; status; }
+
+# vertical scroll: in the tree -> move cursor; in an entered (non-drilled) list ->
+# move the SELECTED element and re-frame on it; otherwise free-pan the camera.
+scroll_v() {
+  [ -n "${CANVAS_DEBUG:-}" ] && echo "SCROLL $1 (ENTERED=$ENTERED DRILL=$DRILL SEL=$SEL)" >&2
+  if [ "$TREEFOCUS" = 1 ]; then tree_move "$1"
+  elif [ "$ENTERED" -ge 0 ] && [ "$DRILL" -lt 0 ]; then SEL=$(( SEL + $1 )); sel_recenter
+  else CY=$(( CY + $1 * PANS[ZI] )); fi
+}
+
+# dispatch one key. Sets QUIT=1 to exit. Multi-byte sequences (arrows, SGR mouse)
+# read their continuation here, so the main loop only ever hands us a first byte.
+handle_key() {
+  local key=$1 c1 c2 ch mb btn
+  case "$key" in
+    q|Q) QUIT=1 ;;
+    t|T) PANEL=$(( 1 - PANEL )); STATUSMSG=$([ "$PANEL" = 1 ] && echo "tree panel on" || echo "tree panel off") ;;
+    $'\t') if [ "$PANEL" = 1 ]; then TREEFOCUS=$(( 1 - TREEFOCUS ))
+             [ "$TREEFOCUS" = 1 ] && CURREF=$(cur_centered_ref)   # start on what we're looking at
+             STATUSMSG=$([ "$TREEFOCUS" = 1 ] && echo "tree focus — j/k walk · ↵ open · e expand" || echo "canvas focus"); fi ;;
+    e|E) expand_all ;;                                          # open the whole visible structure
+    h) CX=$(( CX - PANS[ZI] )) ;;
+    l) CX=$(( CX + PANS[ZI] )) ;;
+    k) scroll_v -1 ;;
+    j) scroll_v 1 ;;
+    +|=) [ "$ZI" -lt $(( ${#ZOOMS[@]} - 1 )) ] && ZI=$(( ZI + 1 )) ;;
+    -|_) [ "$ZI" -gt 0 ] && ZI=$(( ZI - 1 )) ;;
+    0) collapse_drill; ENTERED=-1; TREEFOCUS=0; STATUSMSG=""; fit_structure ;;
+    f|F) if [ "$DRILL" -ge 0 ]; then model_bbox "$PREDRILL_M" "$M"; fit_view "$BBX0" "$BBY0" "$BBX1" "$BBY1"
+         elif [ "$ENTERED" -ge 0 ]; then sel_recenter
+         else fit_structure; fi
+         STATUSMSG="fit to view" ;;
+    $'\n'|$'\r')                                                # ↵ open list / drill element
+      if [ "$TREEFOCUS" = 1 ]; then tree_enter
+      elif [ "$ENTERED" -ge 0 ]; then drill_into "$ENTERED" "$SEL"
+      else enter_huge; fi ;;
+    $'\x7f'|$'\b')                                              # Backspace: close drill, then list
+      if [ "$DRILL" -ge 0 ]; then collapse_drill; STATUSMSG="closed element"
+      elif [ "$ENTERED" -ge 0 ]; then exit_list; STATUSMSG="back to structure"
+      else STATUSMSG=""; fi ;;
+    g) REPLY_LINE=""; prompt_line "goto (path e.g. records[23].child.child, or #): "
+       if [ -z "$REPLY_LINE" ]; then :
+       elif [[ "$REPLY_LINE" =~ ^[0-9]+$ ]] && [ "$ENTERED" -ge 0 ]; then
+         collapse_drill; SEL=$REPLY_LINE; sel_recenter; STATUSMSG="element #$SEL selected — ↵ drill · e expand-all"
+       else STATUSMSG="going to $REPLY_LINE…"; goto_path "$REPLY_LINE"; fi ;;
+    /) REPLY_LINE=""; prompt_line "/"
+       [ -n "$REPLY_LINE" ] && { STATUSMSG="searching…"; grep_find "$REPLY_LINE"; jump_to_match; } ;;
+    n) MIDX=$(( MIDX + 1 )); jump_to_match ;;
+    N) MIDX=$(( MIDX - 1 )); jump_to_match ;;
+    i) STATUSMSG="indexing… (one-time)"; status; build_all_index; STATUSMSG="indexed" ;;
+    $'\e')
+      read -rsn1 -t 0.05 c1 || c1=""
+      if [ "$c1" = "[" ] || [ "$c1" = "O" ]; then
+        read -rsn1 -t 0.05 c2 || c2=""
+        if [ "$c2" = "<" ]; then                                # SGR mouse: \e[<btn;x;y(M|m)
+          mb=""; while read -rsn1 -t 0.05 ch; do case "$ch" in M|m) break ;; *) mb="$mb$ch" ;; esac; done
+          btn=${mb%%;*}
+          [ -n "${CANVAS_DEBUG:-}" ] && echo "MOUSE btn=$btn mb=$mb" >&2
+          case "$btn" in 64) scroll_v -1 ;; 65) scroll_v 1 ;; esac
+        elif [ "$c2" = "M" ]; then                              # legacy X10 mouse: 3 raw bytes
+          read -rsn3 -t 0.05 ch; printf -v btn '%d' "'${ch:0:1}"
+          case $(( btn - 32 )) in 64) scroll_v -1 ;; 65) scroll_v 1 ;; esac
+        else
+          case "$c2" in A) scroll_v -1 ;; B) scroll_v 1 ;; C) CX=$(( CX + PANS[ZI] )) ;; D) CX=$(( CX - PANS[ZI] )) ;; esac
+        fi
+      fi ;;
+  esac
+}
+
+QUIT=0
+while [ "$QUIT" = 0 ]; do
+  [ "$WINCH" = 1 ] && { WINCH=0; read_size; }
+  draw
+  IFS= read -rsN1 key || { [ "$WINCH" = 1 ] && continue; break; }
+  handle_key "$key"
+  # coalesce a burst of buffered keystrokes into ONE redraw (kills the "down then
+  # up takes seconds to catch up" lag: each key no longer forces a full frame).
+  while [ "$QUIT" = 0 ] && IFS= read -rsN1 -t 0.002 key; do handle_key "$key"; done
+done

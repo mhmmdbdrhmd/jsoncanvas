@@ -1,0 +1,13 @@
+# generated test data (create with tools/gen.sh / tools/gen_varied.sh)
+*.json
+
+# on-disk index sidecars built by the viewer
+*.cvidx.*
+
+# screenshot scratch output from tools/loop.sh
+tools/shots/
+
+# editor / OS noise
+*.swp
+*~
+.DS_Store

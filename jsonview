@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# jsonview — lazy, viewport-only JSON browser for huge files.
+# Engine: bash (control) + awk (scan small slices) + coreutils (tail/head/grep).
+# Nothing ever reads more of the file than the slice currently on screen.
+#
+# Usage:  jsonview FILE          interactive browser
+#         jsonview FILE --dump   non-interactive self-test of the engine
+#
+# Keys:   up/down or k/j   move      right/Enter or l   descend
+#         left/Backspace or h  up    + / -   zoom (preview width)
+#         g / G  top / bottom-loaded     q   quit
+
+set -u
+
+FILE="${1:-}"
+MODE="${2:-tui}"
+[ -n "$FILE" ] || { printf 'usage: %s FILE [--dump]\n' "${0##*/}" >&2; exit 2; }
+[ -r "$FILE" ] || { printf 'cannot read: %s\n' "$FILE" >&2; exit 1; }
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCAN="$HERE/lib/scan.awk"
+[ -r "$SCAN" ] || { printf 'missing scanner: %s\n' "$SCAN" >&2; exit 1; }
+FSIZE=$(wc -c < "$FILE")
+
+SLICE_LEN=131072          # bytes pulled per load (the "viewport + margin")
+ESC=$'\e'; NL=$'\n'
+
+# --- read bytes [start, start+len) of the file, nothing else ---
+slice() { # $1=start(0-based) $2=len
+  if [ "$1" -le 0 ]; then head -c "$2" "$FILE"
+  else tail -c "+$(( $1 + 1 ))" "$FILE" | head -c "$2"; fi
+}
+
+# --- current container + its (windowed) children ---
+declare -a cType cKey cEoff cValOff cValLen cPart cPrev
+CUR_OFF=0; CUR_ISOBJ=0
+LOADED=0; RESUME=0; DONE=0; FIRST=1; SLICE_BASE=0
+SEL=0; TOP=0; BATCH=80
+
+# --- breadcrumb / ascend stack ---
+declare -a stOff stIsobj stSel stTop stKey
+
+reset_children() {
+  cType=(); cKey=(); cEoff=(); cValOff=(); cValLen=(); cPart=(); cPrev=()
+  LOADED=0; DONE=0; FIRST=1
+}
+
+_parse() { # stdin: scan output -> append children, update RESUME/DONE
+  local c1 c2 c3 c4 c5 c6 c7
+  while IFS=$'\x1f' read -r c1 c2 c3 c4 c5 c6 c7; do
+    if [ "$c1" = "@" ]; then
+      RESUME=$(( SLICE_BASE + c2 ))
+      [ "$c3" = "1" ] && DONE=1
+      continue
+    fi
+    cType+=("$c1"); cKey+=("$c2")
+    cEoff+=("$(( SLICE_BASE + c3 ))")
+    cValOff+=("$(( SLICE_BASE + c4 ))"); cValLen+=("$c5")
+    cPart+=("$c6"); cPrev+=("$c7")
+    LOADED=$(( LOADED + 1 ))
+  done
+}
+
+load_more() { # $1=batch  -> pull the next chunk of children
+  [ "$DONE" = 1 ] && return 1
+  local before=$LOADED
+  SLICE_BASE=$RESUME
+  # Each call consumes one whole slice (maxitems=0) so RESUME advances by ~a full
+  # slice with no overlapping re-reads; SLICE_LEN is the real throttle.
+  if [ "$FIRST" = 1 ]; then
+    FIRST=0
+    _parse < <(slice "$SLICE_BASE" "$SLICE_LEN" | awk -v maxitems=0 -f "$SCAN")
+  else
+    _parse < <(slice "$SLICE_BASE" "$SLICE_LEN" | awk -v cont=1 -v isobj="$CUR_ISOBJ" -v maxitems=0 -f "$SCAN")
+  fi
+  local added=$(( LOADED - before ))
+  # The last child may straddle (or exceed) the slice boundary.
+  if (( added > 0 )) && [ "${cPart[LOADED-1]}" = 1 ]; then
+    local last=$(( LOADED - 1 ))
+    if (( added == 1 )); then
+      # A single child larger than the whole slice: keep it (still descendable),
+      # but we can't cheaply enumerate any siblings past it.
+      DONE=1
+    else
+      # A normal child that merely crossed the boundary: drop it and resume at
+      # its ELEMENT start, so the next slice re-reads it whole (one cheap re-read).
+      RESUME="${cEoff[last]}"
+      unset 'cType[last]' 'cKey[last]' 'cEoff[last]' 'cValOff[last]' 'cValLen[last]' 'cPart[last]' 'cPrev[last]'
+      LOADED=$last
+      DONE=0
+    fi
+  fi
+}
+
+ensure_loaded() { # ensure child index $1 is loaded (or DONE)
+  local need="$1"
+  while [ "$LOADED" -le "$need" ] && [ "$DONE" != 1 ]; do load_more "$BATCH" || break; done
+}
+
+enter_container() { # $1=abs offset of opening bracket  $2=isobj
+  CUR_OFF="$1"; CUR_ISOBJ="$2"
+  reset_children
+  RESUME="$CUR_OFF"
+  SEL=0; TOP=0
+  load_more "$BATCH"
+}
+
+push_and_enter() { # descend into child index $1 (must be object/array)
+  local idx="$1"
+  stOff+=("$CUR_OFF"); stIsobj+=("$CUR_ISOBJ"); stSel+=("$SEL"); stTop+=("$TOP")
+  local label; if [ "$CUR_ISOBJ" = 1 ]; then label="${cKey[idx]}"; else label="[$idx]"; fi
+  stKey+=("$label")
+  local off="${cValOff[idx]}" isobj=0
+  [ "${cType[idx]}" = object ] && isobj=1
+  enter_container "$off" "$isobj"
+}
+
+pop_container() { # ascend to parent
+  local n=${#stOff[@]}
+  [ "$n" = 0 ] && return 1
+  n=$(( n - 1 ))
+  local off="${stOff[n]}" isobj="${stIsobj[n]}" sel="${stSel[n]}" top="${stTop[n]}"
+  unset 'stOff[n]' 'stIsobj[n]' 'stSel[n]' 'stTop[n]' 'stKey[n]'
+  enter_container "$off" "$isobj"
+  SEL="$sel"; TOP="$top"
+}
+
+# ---- locate root container (first { or [ in the file) ----
+init_root() {
+  local first
+  first=$(head -c 65536 "$FILE" | grep -aboE '[{[]' | head -1)
+  [ -n "$first" ] || { printf 'no JSON object/array found near start of file\n' >&2; exit 1; }
+  local off="${first%%:*}" c="${first##*:}"
+  local isobj=0; [ "$c" = "{" ] && isobj=1
+  enter_container "$off" "$isobj"
+}
+
+# =========================== self-test (--dump) ===========================
+if [ "$MODE" = "--dump" ]; then
+  BATCH=40
+  init_root
+  ensure_loaded 40
+  printf 'ROOT off=%d isobj=%d loaded=%d done=%d\n' "$CUR_OFF" "$CUR_ISOBJ" "$LOADED" "$DONE"
+  for ((i=0;i<LOADED;i++)); do
+    printf '  [%d] %-7s key=%-12s eoff=%-9d valoff=%-9d part=%s  %s\n' \
+      "$i" "${cType[i]}" "${cKey[i]}" "${cEoff[i]}" "${cValOff[i]}" "${cPart[i]}" "${cPrev[i]}"
+  done
+  for ((i=0;i<LOADED;i++)); do
+    if [ "${cType[i]}" = array ]; then
+      printf -- '-- descend into [%d] %s at off %d, then load ~3000 deep --\n' "$i" "${cType[i]}" "${cValOff[i]}"
+      push_and_enter "$i"
+      ensure_loaded 3000
+      printf '   loaded=%d done=%d\n' "$LOADED" "$DONE"
+      printf '   first: %s key=%s valoff=%d  %s\n' "${cType[0]}" "${cKey[0]}" "${cValOff[0]}" "${cPrev[0]}"
+      printf '   #3000: %s valoff=%d  %s\n' "${cType[3000]}" "${cValOff[3000]}" "${cPrev[3000]}"
+      break
+    fi
+  done
+  exit 0
+fi
+
+# =============================== TUI ===============================
+ZOOM=2                              # preview detail level
+cleanup() {
+  printf '%s' "$ESC[?25h$ESC[?1049l"
+  [ -n "${STTY_SAVE:-}" ] && stty "$STTY_SAVE" 2>/dev/null
+}
+trap cleanup EXIT INT TERM
+
+STTY_SAVE=$(stty -g 2>/dev/null || true)
+stty -echo -icanon time 0 min 1 2>/dev/null
+printf '%s' "$ESC[?1049h$ESC[?25l"
+
+clip() { # $1=text $2=width  -> truncated text
+  local t="$1" w="$2"
+  [ "${#t}" -le "$w" ] && { printf '%s' "$t"; return; }
+  printf '%s' "${t:0:w}"
+}
+
+draw() {
+  local size; size=$(stty size 2>/dev/null || echo "24 80")
+  local ROWS="${size% *}" COLS="${size#* }"
+  [ "$ROWS" -gt 2 ] 2>/dev/null || ROWS=24
+  [ "$COLS" -gt 10 ] 2>/dev/null || COLS=80
+  local body=$(( ROWS - 2 ))
+  BATCH=$(( body * 2 + 20 ))
+
+  (( SEL < 0 )) && SEL=0
+  (( SEL < TOP )) && TOP=$SEL
+  (( SEL >= TOP + body )) && TOP=$(( SEL - body + 1 ))
+  (( TOP < 0 )) && TOP=0
+  ensure_loaded $(( TOP + body ))
+  if (( DONE )) && (( SEL >= LOADED )); then SEL=$(( LOADED>0 ? LOADED-1 : 0 )); (( SEL < TOP )) && TOP=$SEL; fi
+
+  local crumb="/"; local k
+  for k in "${stKey[@]:-}"; do [ -n "$k" ] && crumb+="$k/"; done
+  local more=""; (( DONE )) || more=" +more"
+  local hdr="jsonview  ${FILE##*/}  ${FSIZE}B   ${crumb}   $((SEL+1))/${LOADED}${more}  zoom:$ZOOM"
+  local out="$ESC[H$ESC[7m $(clip "$hdr" $((COLS-1)))$ESC[0m$ESC[K$NL"
+
+  local prevw=$(( ZOOM * 18 )); (( prevw < 8 )) && prevw=8
+  local r idx t key pv label val mark row
+  for ((r=0; r<body; r++)); do
+    idx=$(( TOP + r ))
+    if (( idx < LOADED )); then
+      t="${cType[idx]}"; key="${cKey[idx]}"; pv="${cPrev[idx]}"
+      if [ "$CUR_ISOBJ" = 1 ]; then label="$key"; else label="[$idx]"; fi
+      case "$t" in
+        object) val="{...}"; mark=">";;
+        array)  val="[...]"; mark=">";;
+        *)      val="$(clip "$pv" "$prevw")"; mark=" ";;
+      esac
+      row="$mark $label : $val"
+      row="$(clip "$row" $((COLS-1)))"
+      if (( idx == SEL )); then out+="$ESC[7m$row$ESC[0m$ESC[K$NL"; else out+="$row$ESC[K$NL"; fi
+    else
+      out+="$ESC[2m~$ESC[0m$ESC[K$NL"
+    fi
+  done
+
+  local foot="up/dn,jk move  ->,Enter,l descend  <-,Bksp,h up  +/- zoom  g/G ends  q quit"
+  out+="$ESC[7m $(clip "$foot" $((COLS-1)))$ESC[0m$ESC[K"
+  printf '%s' "$out"
+}
+
+descend_sel() {
+  local t="${cType[SEL]:-}"
+  if [ "$t" = object ] || [ "$t" = array ]; then push_and_enter "$SEL"; fi
+}
+
+init_root
+draw
+while true; do
+  IFS= read -rsn1 key || break
+  case "$key" in
+    $'\e')
+      read -rsn2 -t 0.05 rest 2>/dev/null || rest=""
+      case "$rest" in
+        '[A') (( SEL>0 )) && SEL=$(( SEL-1 ));;
+        '[B') SEL=$(( SEL+1 )); ensure_loaded "$SEL"; (( SEL>=LOADED )) && SEL=$(( LOADED>0?LOADED-1:0 ));;
+        '[C') descend_sel;;
+        '[D') pop_container || true;;
+        '') break;;
+      esac;;
+    k|K) (( SEL>0 )) && SEL=$(( SEL-1 ));;
+    j|J) SEL=$(( SEL+1 )); ensure_loaded "$SEL"; (( SEL>=LOADED )) && SEL=$(( LOADED>0?LOADED-1:0 ));;
+    l|L|'') descend_sel;;
+    h|H) pop_container || true;;
+    $'\x7f'|$'\x08') pop_container || true;;
+    +|=) (( ZOOM<8 )) && ZOOM=$(( ZOOM+1 ));;
+    -|_) (( ZOOM>1 )) && ZOOM=$(( ZOOM-1 ));;
+    g) SEL=0; TOP=0;;
+    G) ensure_loaded "$LOADED"; SEL=$(( LOADED>0?LOADED-1:0 ));;
+    q|Q) break;;
+  esac
+  draw
+done
